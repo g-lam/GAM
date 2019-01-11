@@ -7129,6 +7129,18 @@ def getValidateLoginHint(login_hint):
       return login_hint
     print u'Error: that is not a valid email address'
 
+def getValidateProjectId(crm, project_id):
+  while True:
+    if project_id:
+      project_id = project_id.strip()
+    else:
+      project_id = raw_input(u'\nWhat is your API project ID? ').strip()
+    response = callGAPI(crm.projects(), u'list', filter=u'id:%s' % project_id)
+    if u'projects' in response:
+      return project_id
+    else:
+      project_id = None
+
 def getCRMService(login_hint):
   scope = u'https://www.googleapis.com/auth/cloud-platform'
   client_id = u'297408095146-fug707qsjv4ikron0hugpevbrjhkmsk7.apps.googleusercontent.com'
@@ -7207,7 +7219,7 @@ def doUpdateProject(login_hint=None):
   simplehttp = httplib2.Http(disable_ssl_certificate_validation=GC_Values[GC_NO_VERIFY_SSL])
   enableProjectAPIs(simplehttp, httpObj, project_name, True)
 
-def doCreateProject(login_hint=None):
+def _createClientSecrets(httpObj, project_id, project_name, service_account_file, client_secrets_file):
 
   def _checkClientAndSecret(simplehttp, client_id, client_secret):
     url = u'https://www.googleapis.com/oauth2/v4/token'
@@ -7235,6 +7247,87 @@ def doCreateProject(login_hint=None):
     print u'Unknown error: %s' % content
     return False
 
+  simplehttp = httplib2.Http(disable_ssl_certificate_validation=GC_Values[GC_NO_VERIFY_SSL])
+  enableProjectAPIs(simplehttp, httpObj, project_name, False)
+  iam = googleapiclient.discovery.build(u'iam', u'v1', http=httpObj, cache_discovery=False)
+  sa_list = callGAPI(iam.projects().serviceAccounts(), u'list',
+                     name=u'projects/%s' % project_id)
+  service_account = None
+  if u'accounts' in sa_list:
+    for account in sa_list[u'accounts']:
+      sa_email = u'%s@%s.iam.gserviceaccount.com' % (project_id, project_id)
+      if sa_email in account[u'name']:
+        service_account = account
+        break
+  if not service_account:
+    print u'Creating Service Account'
+    service_account = callGAPI(iam.projects().serviceAccounts(), u'create',
+                              name=u'projects/%s' % project_id,
+                              body={u'accountId': project_id, u'serviceAccount': {u'displayName': u'GAM Project'}})
+  key = callGAPI(iam.projects().serviceAccounts().keys(), u'create',
+                 name=service_account[u'name'], body={u'privateKeyType': u'TYPE_GOOGLE_CREDENTIALS_FILE', u'keyAlgorithm': u'KEY_ALG_RSA_2048'})
+  oauth2service_data = base64.b64decode(key[u'privateKeyData'])
+  writeFile(service_account_file, oauth2service_data, continueOnError=False)
+  console_credentials_url = u'https://console.developers.google.com/apis/credentials?project=%s' % project_id
+  while True:
+    print u'''Please go to:
+
+%s
+
+1. Click the blue "Create credentials" button. Choose "OAuth client ID".
+2. Click the blue "Configure consent screen" button. Enter "GAM" for "Product name to show to users".
+3. Leave other fields blank. Click "Save" button.
+3. Choose "Other" and click the blue "Create" button.
+4. Copy your "client ID" value.
+
+''' % console_credentials_url
+    client_id = raw_input(u'Enter your Client ID: ').strip()
+    print u'\nNow go back to your browser and copy your client secret.'
+    client_secret = raw_input(u'Enter your Client Secret: ').strip()
+    client_valid = _checkClientAndSecret(simplehttp, client_id, client_secret)
+    if client_valid:
+      break
+    print
+  cs_data = u'''{
+    "installed": {
+        "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+        "client_id": "%s",
+        "client_secret": "%s",
+        "project_id": "%s",
+        "redirect_uris": [
+            "urn:ietf:wg:oauth:2.0:oob",
+            "http://localhost"
+        ],
+        "token_uri": "https://accounts.google.com/o/oauth2/token"
+    }
+}''' % (client_id, client_secret, project_id)
+  writeFile(client_secrets_file, cs_data, continueOnError=False)
+  print u'''Almost there! Now please switch back to your browser and:
+
+1. Click OK to close "OAuth client" popup if it's still open.
+2. Click "Manage service accounts" on the right of the screen.
+3. Click the 3 dots to the right of your service account.
+4. Choose Edit.
+5. Check the "Enable G Suite Domain-wide Delegation" box and click Save.
+'''
+  raw_input(u'Press Enter when done...')
+  print u'That\'s it! Your GAM Project is created and ready to use.'
+
+def doUseProject(login_hint=None, project_id=None):
+  service_account_file = GC_Values[GC_OAUTH2SERVICE_JSON]
+  client_secrets_file = GC_Values[GC_CLIENT_SECRETS_JSON]
+  for a_file in [service_account_file, client_secrets_file]:
+    if os.path.exists(a_file):
+      systemErrorExit(5, '%s already exists. Please delete or rename it before attempting to use another project.' % a_file)
+  login_hint = getValidateLoginHint(login_hint)
+  login_domain = login_hint[login_hint.find(u'@')+1:]
+  crm, httpObj = getCRMService(login_hint)
+  project_id = getValidateProjectId(crm, project_id)
+  project_name = u'project:%s' % project_id
+  _createClientSecrets(httpObj, project_id, project_name, service_account_file, client_secrets_file)
+
+def doCreateProject(login_hint=None):
   service_account_file = GC_Values[GC_OAUTH2SERVICE_JSON]
   client_secrets_file = GC_Values[GC_CLIENT_SECRETS_JSON]
   for a_file in [service_account_file, client_secrets_file]:
@@ -7317,62 +7410,7 @@ and accept the Terms of Service (ToS). As soon as you've accepted the ToS popup,
     elif u'error' in status:
       systemErrorExit(2, status[u'error'])
     break
-  simplehttp = httplib2.Http(disable_ssl_certificate_validation=GC_Values[GC_NO_VERIFY_SSL])
-  enableProjectAPIs(simplehttp, httpObj, project_name, False)
-  iam = googleapiclient.discovery.build(u'iam', u'v1', http=httpObj, cache_discovery=False)
-  print u'Creating Service Account'
-  service_account = callGAPI(iam.projects().serviceAccounts(), u'create',
-                             name=u'projects/%s' % project_id,
-                             body={u'accountId': project_id, u'serviceAccount': {u'displayName': u'GAM Project'}})
-  key = callGAPI(iam.projects().serviceAccounts().keys(), u'create',
-                 name=service_account[u'name'], body={u'privateKeyType': u'TYPE_GOOGLE_CREDENTIALS_FILE', u'keyAlgorithm': u'KEY_ALG_RSA_2048'})
-  oauth2service_data = base64.b64decode(key[u'privateKeyData'])
-  writeFile(service_account_file, oauth2service_data, continueOnError=False)
-  console_credentials_url = u'https://console.developers.google.com/apis/credentials?project=%s' % project_id
-  while True:
-    print u'''Please go to:
-
-%s
-
-1. Click the blue "Create credentials" button. Choose "OAuth client ID".
-2. Click the blue "Configure consent screen" button. Enter "GAM" for "Product name to show to users".
-3. Leave other fields blank. Click "Save" button.
-3. Choose "Other" and click the blue "Create" button.
-4. Copy your "client ID" value.
-
-''' % console_credentials_url
-    client_id = raw_input(u'Enter your Client ID: ').strip()
-    print u'\nNow go back to your browser and copy your client secret.'
-    client_secret = raw_input(u'Enter your Client Secret: ').strip()
-    client_valid = _checkClientAndSecret(simplehttp, client_id, client_secret)
-    if client_valid:
-      break
-    print
-  cs_data = u'''{
-    "installed": {
-        "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-        "client_id": "%s",
-        "client_secret": "%s",
-        "project_id": "%s",
-        "redirect_uris": [
-            "urn:ietf:wg:oauth:2.0:oob",
-            "http://localhost"
-        ],
-        "token_uri": "https://accounts.google.com/o/oauth2/token"
-    }
-}''' % (client_id, client_secret, project_id)
-  writeFile(client_secrets_file, cs_data, continueOnError=False)
-  print u'''Almost there! Now please switch back to your browser and:
-
-1. Click OK to close "OAuth client" popup if it's still open.
-2. Click "Manage service accounts" on the right of the screen.
-3. Click the 3 dots to the right of your service account.
-4. Choose Edit.
-5. Check the "Enable G Suite Domain-wide Delegation" box and click Save.
-'''
-  raw_input(u'Press Enter when done...')
-  print u'That\'s it! Your GAM Project is created and ready to use.'
+  _createClientSecrets(httpObj, project_id, project_name, service_account_file, client_secrets_file)
 
 def doGetTeamDriveInfo(users):
   teamDriveId = sys.argv[5]
@@ -12651,6 +12689,20 @@ def ProcessGAMCommand(args):
         doCreateFeature()
       else:
         systemErrorExit(2, '%s is not a valid argument for "gam create"' % argument)
+      sys.exit(0)
+    elif command == u'use':
+      argument = sys.argv[2].lower()
+      if argument in [u'project', u'apiproject']:
+        login_hint = None
+        project_id = None
+        try:
+          login_hint = sys.argv[3]
+          project_id = sys.argv[4]
+        except IndexError:
+          pass
+        doUseProject(login_hint, project_id)
+      else:
+        systemErrorExit(2, '%s is not a valid argument for "gam attach"' % argument)
       sys.exit(0)
     elif command == u'update':
       argument = sys.argv[2].lower()
